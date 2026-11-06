@@ -5,6 +5,7 @@ import { ProviderRejectedError } from "../providers/receipts.ts";
 import type { XPostData } from "../content/materials.ts";
 import { sha256 } from "../lib/ids.ts";
 import { FetchError, type Candidate, type SourceRow } from "./types.ts";
+import { xHandle } from "./account.ts";
 
 function avatar(url: string | undefined): string | null {
   // Larger avatar than the default 48px thumbnail.
@@ -83,11 +84,31 @@ const MAX_PAGES = 10;
 const MAX_BACKLOG_PAGES = 10;
 /** Stretches kept per source; beyond this the oldest is given up and reported. */
 const MAX_BACKLOG = 5;
+/**
+ * How long a stretch left over stays worth reading. A run reads ten of its pages, so a search still not
+ * caught up after days is stuck (or its accounts moved between shards); what is left in it is older than
+ * the site's archive window anyway, and every further page buys posts that are already stored.
+ */
+const MAX_BACKLOG_AGE_MS = 3 * 86_400_000;
+/** The oldest instant a post id can name (the id scheme starts 2010-11-04); an invented id names none. */
+const ID_TIME_FLOOR_MS = Date.parse("2011-01-01T00:00:00Z");
 
 /** Where a newest-first search stopped at the page limit: the same query continues from `next`. */
 export interface XBacklog {
   query: string;
   next: string;
+  /** When it was first left over; missing from cursors kept before this was recorded. */
+  at?: string;
+}
+
+/** When a stretch was left over: its recorded creation, else the instant its since_id names. */
+function stretchSince(stretch: XBacklog): number | null {
+  const recorded = Date.parse(stretch.at ?? "");
+  if (Number.isFinite(recorded)) return recorded;
+  const sinceId = /since_id:(\d+)/.exec(stretch.query)?.[1];
+  if (!sinceId) return null;
+  const instant = Number((BigInt(sinceId) >> 22n) + 1288834974657n);
+  return instant >= ID_TIME_FLOOR_MS ? instant : null;
 }
 
 export interface XRead {
@@ -101,7 +122,7 @@ export interface XRead {
   /** The new-post search stopped at the page limit; the rest joined the backlog. */
   truncated: boolean;
   backlogPages: number;
-  /** Stretches given up (too many, or the provider refused to continue one): posts in them may be missing. */
+  /** Stretches given up (too many, too old, or the provider refused to continue one): posts in them may be missing. */
   dropped: number;
 }
 
@@ -118,7 +139,24 @@ export interface XFetch extends Omit<XRead, "tweets"> {
  */
 export async function readXSearch(base: string, opts: { lastId: string | null; backlog: XBacklog[]; subject: string; type?: "Latest" | "Top" }): Promise<XRead> {
   const { lastId } = opts;
-  const backlog = opts.backlog.map((b) => ({ ...b }));
+  // One stretch per query, and none left over for days. A shard's stretches travel with its accounts, so
+  // regrouping can leave copies of the same query at different positions in several shards, each of them
+  // buying the same pages again; a stretch the page limit never catches up with only buys archived posts.
+  let dropped = 0;
+  const stretches = new Set<string>();
+  const now = Date.now();
+  const backlog = opts.backlog
+    .filter((b) => {
+      if (stretches.has(b.query)) return false;
+      stretches.add(b.query);
+      const since = stretchSince(b);
+      if (since !== null && now - since > MAX_BACKLOG_AGE_MS) {
+        dropped += 1;
+        return false;
+      }
+      return true;
+    })
+    .map((b) => ({ ...b }));
   const window = windowKey();
   const search = (query: string, cursor: string | null) =>
     searchTweets(query, { purpose: "source_fetch", subject: opts.subject, window, type: opts.type ?? "Latest", cursor });
@@ -136,7 +174,7 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
       // A later page failing keeps the pages already read; the search goes on from there next run.
       if (!cursor) throw error;
       truncated = true;
-      backlog.push({ query, next: cursor });
+      backlog.push({ query, next: cursor, at: new Date().toISOString() });
       break;
     }
     pages += 1;
@@ -145,7 +183,7 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
     if (!lastId || !res.nextCursor || res.tweets.length === 0) break;
     if (pages >= MAX_PAGES) {
       truncated = true;
-      backlog.push({ query, next: res.nextCursor });
+      backlog.push({ query, next: res.nextCursor, at: new Date().toISOString() });
       break;
     }
     cursor = res.nextCursor;
@@ -153,7 +191,6 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
 
   // Older stretches, oldest first. Budget, account or passing trouble leaves them for the next run; a
   // position the provider refuses as a bad request (an expired cursor) is given up.
-  let dropped = 0;
   while (backlog.length > MAX_BACKLOG) {
     backlog.shift();
     dropped += 1;
@@ -185,13 +222,16 @@ export async function readXSearch(base: string, opts: { lastId: string | null; b
   return { tweets, receiptIds: [...receiptIds], lastId: maxId, backlog, pages, truncated, backlogPages, dropped };
 }
 
-/** One account's own search (its first fetch, a query of its own, or a manual run from the admin). */
-export async function fetchXSearch(source: SourceRow): Promise<XFetch> {
+/**
+ * One account's own search (its first fetch, a query of its own, or a manual run from the admin), from
+ * its watermark or from an earlier post (`since`).
+ */
+export async function fetchXSearch(source: SourceRow, since?: string): Promise<XFetch> {
   const handle = selfThreadHandle(source);
   const base = handle ? `from:${handle} (-filter:replies OR filter:self_threads)` : String(source.config.query ?? "");
   if (!base) throw new FetchError("query missing");
   const { tweets, ...read } = await readXSearch(base, {
-    lastId: source.cursor?.lastTweetId ?? null,
+    lastId: since ?? source.cursor?.lastTweetId ?? null,
     backlog: Array.isArray(source.cursor?.xBacklog) ? source.cursor.xBacklog : [],
     subject: `source:${source.id}`,
     type: source.config.searchType ?? "Latest",
@@ -199,10 +239,11 @@ export async function fetchXSearch(source: SourceRow): Promise<XFetch> {
   return { candidates: tweets.map(tweetToCandidate), ...read };
 }
 
-// Shards: plain account queries read together
+// Shards: plain account queries read together. One search per account overran the SocialData budget on
+// production's first day (2026-09-28).
 
 /** A query that can share a search: exactly "from:handle -filter:replies", newest first. */
-const SHARDABLE = /^from:([A-Za-z0-9_]{1,15}) -filter:replies$/i;
+const SHARDABLE = /^from:[A-Za-z0-9_]{1,15} -filter:replies$/i;
 /** The same test in SQL, for the schedulers. */
 export const SHARDABLE_SQL = "^from:[A-Za-z0-9_]{1,15} -filter:replies$";
 /** SocialData refuses queries over 512 characters; the since_id watermark takes about 30 of them. */
@@ -212,13 +253,13 @@ const SHARD_MAX_ACCOUNTS = 24;
 /** The account a source reads, when it can share a search: a plain query and a watermark already set. */
 export function shardHandle(s: Pick<SourceRow, "kind" | "config" | "cursor">): string | null {
   if (s.kind !== "x_search" || (s.config.searchType ?? "Latest") !== "Latest" || !s.cursor?.lastTweetId) return null;
-  return SHARDABLE.exec(String(s.config.query ?? ""))?.[1] ?? null;
+  return SHARDABLE.test(String(s.config.query ?? "")) ? xHandle(s.config) : null;
 }
 
 /** Verified publisher identity permits its own announcement thread, not conversations with others. */
 export function selfThreadHandle(s: Pick<SourceRow, "config">): string | null {
   if (s.config.publisherRole !== "organization" && s.config.publisherRole !== "person") return null;
-  return SHARDABLE.exec(String(s.config.query ?? ""))?.[1] ?? null;
+  return SHARDABLE.test(String(s.config.query ?? "")) ? xHandle(s.config) : null;
 }
 
 export function shardQuery(handles: string[], selfThreads: string[] = []): string {
