@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router";
 import type { ItemAvailability } from "@aihot/contracts/site";
+import { shortAddresses } from "@aihot/contracts/addresses";
 import { SITE } from "@aihot/site";
 import { Presence } from "../components/ui/Presence";
 import { edgeTtl } from "../lib/api.server";
@@ -146,7 +147,7 @@ export default function StarredPage() {
         <ul className="mt-3 lg:space-y-3">
           {starred.map((s) => {
             const current = availability[s.id];
-            const status = current?.status;
+            const status = s.href ? undefined : current?.status;
             const unavailable = status === "unavailable";
             return (
               <li key={s.id} data-card-key={s.id} className={`relative border-b border-line-soft py-4 lg:card lg:px-[18px] lg:py-[15px] ${unavailable ? "opacity-70" : "lg:card-hover"}`}>
@@ -164,12 +165,12 @@ export default function StarredPage() {
                   {unavailable ? (
                     s.title
                   ) : (
-                    <Link viewTransition to={`/items/${s.id}`} className="transition-colors after:absolute after:inset-0 after:content-[''] hover:text-accent">
+                    <Link viewTransition to={s.href ?? `/items/${s.id}`} className="transition-colors after:absolute after:inset-0 after:content-[''] hover:text-accent">
                       {s.title}
                     </Link>
                   )}
                 </h2>
-                {s.summary && <p className="mt-1.5 line-clamp-2 text-[14px] leading-[1.75] text-ink-3">{s.summary}</p>}
+                {s.summary && <p className="mt-1.5 line-clamp-2 text-[14px] leading-[1.75] text-ink-3">{shortAddresses(s.summary)}</p>}
                 {unavailable && <p className="mt-2 text-[12.5px] text-hot">这条内容已经下架，收藏会一直保留，直到你手动移除。</p>}
                 {status === "summary-only" && <p className="mt-2 text-[12.5px] text-amber-ink">应来源方要求，这条内容现在只提供摘要。</p>}
               </li>
