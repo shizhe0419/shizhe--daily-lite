@@ -109,7 +109,7 @@
       "name": "NVIDIA Blog",
       "kind": "rss",
       "config": {
-        "feedUrl": "https://blogs.nvidia.com/feed/",
+        "feedUrl": "https://developer.nvidia.com/blog/feed",
         "_aihot": {
           "initialBackfillLimit": 8
         }
